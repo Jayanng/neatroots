@@ -73,6 +73,59 @@ describe("coding-agent MCP setup", () => {
     expect(fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8")).toBe(before);
   });
 
+  it("replaces a quoted [mcp_servers.\"neatroots\"] table instead of adding a second, invalid one", () => {
+    fs.mkdirSync(path.join(home, ".codex"));
+    const before = 'model = "gpt-5"\n\n[mcp_servers."neatroots"]\ncommand = "stale"\n\n[mcp_servers.other]\ncommand = "x"\n';
+    fs.writeFileSync(path.join(home, ".codex/config.toml"), before);
+    const codex = findClient("codex")!;
+    // Quoted and bare spell the same table name, so this file already connects Codex.
+    expect(clientStatus(codex).connected).toBe(true);
+    expect(connectClient(codex, cmd).ok).toBe(true);
+    const text = fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8");
+    // One table for us, spelled bare; the stale quoted one is gone. Two definitions of
+    // the same table are invalid TOML and would stop Codex reading its whole config.
+    expect(text.match(/\[mcp_servers\.neatroots\]/g)).toHaveLength(1);
+    expect(text).not.toContain('command = "stale"');
+    expect(text).toContain('command = "/opt/neatroots/bin/neatroots"');
+    expect(text).toContain("[mcp_servers.other]");
+    disconnectClient(codex);
+    expect(fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8")).toBe('model = "gpt-5"\n\n[mcp_servers.other]\ncommand = "x"\n');
+  });
+
+  it("does not read a bracketed line inside a multi-line string as a table", () => {
+    fs.mkdirSync(path.join(home, ".codex"));
+    const before = 'instructions = """\nexample:\n[mcp_servers.neatroots]\ncommand = "stale"\n"""\n\n[mcp_servers.other]\ncommand = "x"\n';
+    fs.writeFileSync(path.join(home, ".codex/config.toml"), before);
+    const codex = findClient("codex")!;
+    connectClient(codex, cmd);
+    const text = fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8");
+    // The string keeps its closing delimiter and its contents; dropping them would leave
+    // one unterminated multi-line string swallowing the rest of the file.
+    expect(text).toContain('[mcp_servers.neatroots]\ncommand = "stale"\n"""');
+    disconnectClient(codex);
+    expect(fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8")).toBe(before);
+  });
+
+  it("clears our entry however TOML spells it: quoted legacy names, sub-tables, dotted keys", () => {
+    fs.mkdirSync(path.join(home, ".codex"));
+    const before =
+      'mcp_servers.neatroots = { command = "stale" }\n\n[mcp_servers."neatbolt".env]\nA = "1"\n\n[mcp_servers.other]\ncommand = "x"\n';
+    fs.writeFileSync(path.join(home, ".codex/config.toml"), before);
+    const codex = findClient("codex")!;
+    expect(connectClient(codex, cmd).ok).toBe(true);
+    let text = fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8");
+    expect(text).not.toContain("neatbolt");
+    expect(text).not.toContain('"stale"');
+    expect(text).toContain("[mcp_servers.other]");
+    expect(text.match(/\[mcp_servers\.neatroots\]/g)).toHaveLength(1);
+    disconnectClient(codex);
+    text = fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8");
+    expect(text).not.toContain("neatbolt");
+    expect(text).not.toContain("[mcp_servers.neatroots]");
+    expect(text).toContain("[mcp_servers.other]");
+    expect(text).toContain('command = "x"');
+  });
+
   // Agent configs often hold other MCP servers' tokens in their env blocks.
   it.skipIf(process.platform === "win32")("keeps a private config file private", () => {
     fs.mkdirSync(path.join(home, ".cursor"));

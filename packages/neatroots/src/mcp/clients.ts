@@ -227,24 +227,120 @@ function jsonSet(file: string, shape: Shape, cmd: ServerCommand | null): string 
 }
 
 // ------------------------------------------------------------------ TOML
+//
+// Finding our entry has to read TOML a little, because the same table can be spelled
+// several ways: [mcp_servers."neatroots"] names the same table as [mcp_servers.neatroots],
+// a definition can be dotted (mcp_servers.neatroots = { ... }), and a bracketed line
+// inside a multi-line string is string content, not a table header. Missing a spelling
+// adds a second definition of the same table, which is invalid TOML and stops the agent
+// reading its whole config; treating string content as a header deletes the closing
+// delimiter and corrupts the file.
 
-const TOML_HEADER = new RegExp(`^\\[mcp_servers\\.${SERVER_NAME}(\\..+)?\\]\\s*$`);
-const TOML_ANY_OURS = new RegExp(`^\\[mcp_servers\\.(${[SERVER_NAME, ...LEGACY_NAMES].join("|")})(\\..+)?\\]\\s*$`);
+const OUR_NAMES = new Set([SERVER_NAME, ...LEGACY_NAMES]);
 
-/** Removes our [mcp_servers.neatroots] table (and its sub-tables), leaving everything else as written. */
-function stripTomlEntry(text: string): string {
-  const out: string[] = [];
-  let skipping = false;
-  for (const line of text.split("\n")) {
-    const t = line.trim();
-    if (t.startsWith("[")) skipping = TOML_ANY_OURS.test(t);
-    if (!skipping) out.push(line);
+/** Key path of a dotted TOML key or header body, with quotes removed: 'a."b".c' -> [a, b, c]. */
+function tomlKeyPath(text: string): string[] {
+  const parts: string[] = [];
+  const re = /"((?:[^"\\]|\\.)*)"|'([^']*)'|([^.\s"']+)/g;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    parts.push(m[1] !== undefined ? m[1].replace(/\\(.)/g, "$1") : (m[2] ?? m[3]));
   }
-  return out.join("\n").replace(/\n{3,}/g, "\n\n");
+  return parts;
+}
+
+/** Our entry: mcp_servers.<ours>, with anything below it (sub-tables, sub-keys). */
+function isOursPath(full: string[]): boolean {
+  return full[0] === "mcp_servers" && full.length >= 2 && OUR_NAMES.has(full[1]);
+}
+
+function tomlTablePath(line: string): string[] | null {
+  const m = /^\[\[?([^\]]+)\]\]?\s*$/.exec(line.trim());
+  return m ? tomlKeyPath(m[1]) : null;
+}
+
+/** The multi-line string (""" or ''') a line leaves open, honouring single-line strings. */
+function multiOpenAfter(line: string, was: string | null): string | null {
+  let ml = was;
+  let i = 0;
+  while (i < line.length) {
+    if (ml) {
+      const at = line.indexOf(ml, i);
+      if (at < 0) return ml;
+      if (ml === '"""' && at > 0 && line[at - 1] === "\\") {
+        i = at + 3;
+        continue;
+      }
+      ml = null;
+      i = at + 3;
+      continue;
+    }
+    if (line.startsWith('"""', i)) {
+      ml = '"""';
+      i += 3;
+      continue;
+    }
+    if (line.startsWith("'''", i)) {
+      ml = "'''";
+      i += 3;
+      continue;
+    }
+    const ch = line[i];
+    if (ch === '"' || ch === "'") {
+      i += 1;
+      while (i < line.length && line[i] !== ch) i += ch === '"' && line[i] === "\\" ? 2 : 1;
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return ml;
+}
+
+/**
+ * Removes our entry however it is spelled, leaving everything else as written; reports
+ * whether the file defined us at all. Inline tables are single-line by the TOML spec, so
+ * a dotted definition of our key always ends on its own line.
+ */
+function scanToml(text: string): { text: string; ours: boolean } {
+  const out: string[] = [];
+  let ours = false;
+  let skipping = false;
+  let ml: string | null = null;
+  let table: string[] = [];
+  for (const line of text.split("\n")) {
+    if (ml) {
+      ml = multiOpenAfter(line, ml);
+      if (!skipping) out.push(line);
+      continue;
+    }
+    const t = line.trim();
+    const header = t.startsWith("[") ? tomlTablePath(t) : null;
+    if (header) {
+      table = header;
+      skipping = isOursPath(header);
+      ours ||= skipping;
+      if (!skipping) out.push(line);
+      continue;
+    }
+    const eq = t.indexOf("=");
+    const key = eq > 0 ? t.slice(0, eq).trim() : "";
+    const oursKey = Boolean(key) && !/[[\]{}]/.test(key) && isOursPath([...table, ...tomlKeyPath(key)]);
+    if (oursKey) {
+      ours = true;
+      continue;
+    }
+    if (!skipping) out.push(line);
+    ml = multiOpenAfter(line, null);
+  }
+  return { text: out.join("\n").replace(/\n{3,}/g, "\n\n"), ours };
+}
+
+function stripTomlEntry(text: string): string {
+  return scanToml(text).text;
 }
 
 function tomlHas(file: string): boolean {
-  return fs.existsSync(file) && fs.readFileSync(file, "utf8").split("\n").some((l) => TOML_HEADER.test(l.trim()));
+  return fs.existsSync(file) && scanToml(fs.readFileSync(file, "utf8")).ours;
 }
 
 function tomlSet(file: string, cmd: ServerCommand | null): void {
