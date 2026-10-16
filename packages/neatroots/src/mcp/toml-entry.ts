@@ -39,7 +39,44 @@ function tomlTablePath(line: string): string[] | null {
 }
 
 /**
- * The multi-line string (""" or ''') a line leaves open, honouring single-line strings.
+ * The part of a line TOML actually parses: everything before an unquoted #. Quotes and
+ * multi-line delimiters are honoured, so `x = "a # b" # note` keeps the string and drops
+ * only the comment — which also makes a header with a trailing comment still a header.
+ */
+function codePart(line: string): string {
+  let ml: string | null = null;
+  let i = 0;
+  while (i < line.length) {
+    if (ml) {
+      const at = line.indexOf(ml, i);
+      if (at < 0) return line;
+      if (ml === '"""' && at > 0 && line[at - 1] === "\\") {
+        i = at + 3;
+        continue;
+      }
+      ml = null;
+      i = at + 3;
+      continue;
+    }
+    const ch = line[i];
+    if (ch === "#") return line.slice(0, i);
+    if (line.startsWith('"""', i) || line.startsWith("'''", i)) {
+      ml = line.slice(i, i + 3);
+      i += 3;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      i += 1;
+      while (i < line.length && line[i] !== ch) i += ch === '"' && line[i] === "\\" ? 2 : 1;
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return line;
+}
+
+/** The multi-line string (""" or ''') a line leaves open, honouring single-line strings.
  * Scanning stops at the first unquoted # : the rest of the line is a comment, so its
  * quotes and delimiters never open or close a string.
  */
@@ -140,7 +177,7 @@ export function scanToml(text: string): TomlScan {
       }
       continue;
     }
-    const t = line.trim();
+    const t = codePart(line).trim();
     if (t.startsWith("#")) {
       if (skipping) drop();
       else keep(line);

@@ -211,6 +211,22 @@ describe("coding-agent MCP setup", () => {
     expect(fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8")).toBe('a = """\nx\n\n\ny"""\n\n[z]\nb = 2\n');
   });
 
+  it("reads a table header with a trailing comment as our table", () => {
+    fs.mkdirSync(path.join(home, ".codex"));
+    const before = 'top = 1\n\n[mcp_servers.neatroots] # neatroots\ncommand = "stale"\n\n[mcp_servers.other]\ncommand = "x"\n';
+    fs.writeFileSync(path.join(home, ".codex/config.toml"), before);
+    const codex = findClient("codex")!;
+    expect(clientStatus(codex).connected).toBe(true);
+    expect(connectClient(codex, cmd).ok).toBe(true);
+    const text = fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8");
+    expect(text.match(/\[mcp_servers\.neatroots\]/g)).toHaveLength(1);
+    expect(text).not.toContain('"stale"');
+    disconnectClient(codex);
+    expect(fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8")).toBe(
+      'top = 1\n\n[mcp_servers.other]\ncommand = "x"\n',
+    );
+  });
+
   it("installs neatroots' skills where Codex reads them, and removes them on disconnect", () => {
     const codex = findClient("codex")!;
     expect(connectClient(codex, cmd).message).toContain("4 skills");
