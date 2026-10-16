@@ -154,6 +154,63 @@ describe("coding-agent MCP setup", () => {
     expect(JSON.parse(fs.readFileSync(real, "utf8")).mcpServers).toEqual({ other: { command: "x" }, neatroots: cmd });
   });
 
+  it("stops TOML scanning at an unquoted # so a comment containing \"\"\" cannot open a string", () => {
+    fs.mkdirSync(path.join(home, ".codex"));
+    const before = '# use """ for long strings\n\n[mcp_servers.neatroots]\ncommand = "stale"\n\n[mcp_servers.other]\ncommand = "x"\n';
+    fs.writeFileSync(path.join(home, ".codex/config.toml"), before);
+    const codex = findClient("codex")!;
+    // The comment's quotes must not open a multi-line string that swallows our table.
+    expect(clientStatus(codex).connected).toBe(true);
+    expect(connectClient(codex, cmd).ok).toBe(true);
+    const text = fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8");
+    expect(text.match(/\[mcp_servers\.neatroots\]/g)).toHaveLength(1);
+    expect(text).toContain('# use """ for long strings');
+    expect(text).not.toContain('command = "stale"');
+    disconnectClient(codex);
+    expect(fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8")).toBe(
+      '# use """ for long strings\n\n[mcp_servers.other]\ncommand = "x"\n',
+    );
+  });
+
+  it("drops a dotted key of ours together with its multi-line value", () => {
+    fs.mkdirSync(path.join(home, ".codex"));
+    const before = '[mcp_servers]\nother = 1\nneatroots.description = """\nline with [mcp_servers.fake]\n"""\n\n[mcp_servers.other]\ncommand = "x"\n';
+    fs.writeFileSync(path.join(home, ".codex/config.toml"), before);
+    const codex = findClient("codex")!;
+    connectClient(codex, cmd);
+    const text = fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8");
+    // The dotted key goes with its whole value: no leftover body, no stray closing delimiter.
+    expect(text).not.toContain("neatroots.description");
+    expect(text).not.toContain("line with [mcp_servers.fake]");
+    expect(text.split('"""')).toHaveLength(1); // no stray multi-line delimiters left behind
+    expect(text).toContain("other = 1");
+    disconnectClient(codex);
+    expect(fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8")).toBe(
+      '[mcp_servers]\nother = 1\n\n[mcp_servers.other]\ncommand = "x"\n',
+    );
+  });
+
+  it("status counts only the current server name, while removal still clears legacy names", () => {
+    fs.mkdirSync(path.join(home, ".codex"));
+    fs.writeFileSync(path.join(home, ".codex/config.toml"), '[mcp_servers.neatbolt]\ncommand = "old"\n');
+    const codex = findClient("codex")!;
+    // A legacy-only entry is not the neatroots MCP server; jsonHas never counted it either.
+    expect(clientStatus(codex).connected).toBe(false);
+    disconnectClient(codex); // cleanup still strips it
+    expect(fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8")).toBe("");
+  });
+
+  it("collapses blank lines only where our entry was removed, byte-exact elsewhere", () => {
+    fs.mkdirSync(path.join(home, ".codex"));
+    const before = 'a = """\nx\n\n\ny"""\n\n[mcp_servers.neatroots]\ncommand = "stale"\n\n[z]\nb = 2\n';
+    fs.writeFileSync(path.join(home, ".codex/config.toml"), before);
+    const codex = findClient("codex")!;
+    connectClient(codex, cmd);
+    disconnectClient(codex);
+    // The two blank lines inside the other entry's multi-line string are content.
+    expect(fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8")).toBe('a = """\nx\n\n\ny"""\n\n[z]\nb = 2\n');
+  });
+
   it("installs neatroots' skills where Codex reads them, and removes them on disconnect", () => {
     const codex = findClient("codex")!;
     expect(connectClient(codex, cmd).message).toContain("4 skills");
