@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { clientStatus, connectClient, disconnectClient, findClient } from "../src/mcp/clients.js";
+import { scanToml } from "../src/mcp/toml-entry.js";
 
 const cmd = { command: "/opt/neatroots/bin/neatroots", args: ["mcp"] };
 let home: string;
@@ -246,5 +247,65 @@ describe("coding-agent MCP setup", () => {
     const r = connectClient(claude, cmd);
     expect(r.ok).toBe(false);
     expect(r.message).toContain("claude mcp add --scope user neatroots -- /opt/neatroots/bin/neatroots mcp");
+  });
+});
+
+describe("toml entry scanning (review round 2 regressions)", () => {
+  it("drops a multi-line array after a multi-line value inside our own table", () => {
+    const text = [
+      '[mcp_servers.neatroots]',
+      'command = "stale"',
+      'description = """',
+      'hello',
+      '"""',
+      'args = [',
+      '  "--stdio",',
+      ']',
+      'other_key = 1',
+      '',
+      '[mcp_servers.other]',
+      'command = "x"',
+      '',
+    ].join("\n");
+    const out = scanToml(text);
+    expect(out.server).toBe(true);
+    // Everything from our header to the next header goes: a closed multi-line value
+    // must not end the skip while we are still inside our table.
+    expect(out.text).not.toContain("hello");
+    expect(out.text).not.toContain("--stdio");
+    expect(out.text).not.toContain("other_key");
+    expect(out.text).toContain('[mcp_servers.other]\ncommand = "x"');
+  });
+
+  it("drops a dotted key's multi-line array under [mcp_servers]", () => {
+    const text = [
+      '[mcp_servers]',
+      'neatroots.args = [',
+      '  "--stdio",',
+      ']',
+      'keep = 1',
+      '',
+    ].join("\n");
+    const out = scanToml(text);
+    expect(out.server).toBe(true);
+    // the array's lines and its closing bracket go with the key: leftover "]" or
+    // '"--stdio",' would be invalid TOML.
+    expect(out.text).toBe("[mcp_servers]\nkeep = 1\n");
+  });
+
+  it("an escaped backslash before the closing delimiter does not swallow the file (open tracking)", () => {
+    // TOML source 's = """C:\\"""' is a closed string (\\ is one escaped backslash), so the
+    // table below is real and must be seen.
+    const text = 's = """C:\\\\"""\n\n[mcp_servers.neatroots]\ncommand = "stale"\n';
+    const out = scanToml(text);
+    expect(out.server).toBe(true);
+    expect(out.text).not.toContain('command = "stale"');
+  });
+
+  it("an escaped backslash before the closing delimiter does not swallow the file (comment stripping)", () => {
+    const text = 's = """C:\\\\""" # note\n[mcp_servers.neatroots]\ncommand = "stale"\n';
+    const out = scanToml(text);
+    expect(out.server).toBe(true);
+    expect(out.text).not.toContain('command = "stale"');
   });
 });

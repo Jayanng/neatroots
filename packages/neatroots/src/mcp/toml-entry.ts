@@ -4,11 +4,21 @@
 // The same table can be spelled several ways: [mcp_servers."neatroots"] names the same
 // table as [mcp_servers.neatroots], a definition can be dotted (mcp_servers.neatroots =
 // { ... }), and a bracketed line inside a multi-line string is string content, not a
-// table header. Quotes inside a # comment are comment, not code: a `# use """ for long
+// table header. Quotes inside a # comment are comment, not code: a `# use \"\"\" for long
 // strings` comment must never open a string that swallows the rest of the file. Missing
 // a spelling adds a second definition of the same table, which is invalid TOML and stops
 // the agent reading its whole config; treating string content as a header, comments as
 // code, or a multi-line value as one line corrupts the file.
+//
+// Removal semantics follow the TOML grammar:
+//   - our [table] is skipped header to header, so every value inside it — single-line,
+//     multi-line string, or multi-line array — goes with it and cannot end the skip;
+//   - a dotted key of ours goes with its whole value (single-line, multi-line string,
+//     or multi-line array), then scanning resumes exactly as before the key;
+//   - a header is only a header at bracket depth zero outside strings and comments,
+//     so `[1, 2]` alone on a line inside a multi-line array is array content.
+// A closing `"""` preceded by an ODD run of backslashes is escaped (the run's parity
+// decides), so `s = """C:\\"""` is one closed string and never swallows the file.
 
 import fs from "node:fs";
 
@@ -38,19 +48,39 @@ function tomlTablePath(line: string): string[] | null {
   return m ? tomlKeyPath(m[1]) : null;
 }
 
+/** A `"""` close at `at` is escaped when preceded by an odd number of backslashes. */
+function escapedByRun(line: string, at: number): boolean {
+  let run = 0;
+  for (let i = at - 1; i >= 0 && line[i] === "\\"; i--) run++;
+  return run % 2 === 1;
+}
+
+interface Walk {
+  /** Everything before the first unquoted # (the part TOML parses as code). */
+  code: string;
+  /** The multi-line string left open after this line, if any. */
+  ml: string | null;
+  /** Net bracket depth of code outside strings and comments on this line. */
+  depth: number;
+}
+
 /**
- * The part of a line TOML actually parses: everything before an unquoted #. Quotes and
- * multi-line delimiters are honoured, so `x = "a # b" # note` keeps the string and drops
- * only the comment — which also makes a header with a trailing comment still a header.
+ * One pass over a line with full TOML awareness: a comment ends the code part,
+ * single-line strings hide their contents, multi-line delimiters open and close
+ * (parity of the backslash run decides for `"""`), and brackets only count outside
+ * strings and comments. Every line goes through here, so header detection, key
+ * detection and value tracking always agree on what is code.
  */
-function codePart(line: string): string {
-  let ml: string | null = null;
+function walkLine(line: string, mlStart: string | null): Walk {
+  let ml = mlStart;
+  let depth = 0;
+  const codeEnd = line.length;
   let i = 0;
   while (i < line.length) {
     if (ml) {
       const at = line.indexOf(ml, i);
-      if (at < 0) return line;
-      if (ml === '"""' && at > 0 && line[at - 1] === "\\") {
+      if (at < 0) return { code: line, ml, depth };
+      if (ml === '"""' && escapedByRun(line, at)) {
         i = at + 3;
         continue;
       }
@@ -59,7 +89,7 @@ function codePart(line: string): string {
       continue;
     }
     const ch = line[i];
-    if (ch === "#") return line.slice(0, i);
+    if (ch === "#") return { code: line.slice(0, i), ml: null, depth };
     if (line.startsWith('"""', i) || line.startsWith("'''", i)) {
       ml = line.slice(i, i + 3);
       i += 3;
@@ -71,51 +101,11 @@ function codePart(line: string): string {
       i += 1;
       continue;
     }
-    i += 1;
+    if (ch === "[") depth++;
+    if (ch === "]") depth--;
+    i++;
   }
-  return line;
-}
-
-/** The multi-line string (""" or ''') a line leaves open, honouring single-line strings.
- * Scanning stops at the first unquoted # : the rest of the line is a comment, so its
- * quotes and delimiters never open or close a string.
- */
-function multiOpenAfter(line: string, was: string | null): string | null {
-  let ml = was;
-  let i = 0;
-  while (i < line.length) {
-    if (ml) {
-      const at = line.indexOf(ml, i);
-      if (at < 0) return ml;
-      if (ml === '"""' && at > 0 && line[at - 1] === "\\") {
-        i = at + 3;
-        continue;
-      }
-      ml = null;
-      i = at + 3;
-      continue;
-    }
-    const ch = line[i];
-    if (ch === "#") return null; // comment: the rest of the line is not code
-    if (line.startsWith('"""', i)) {
-      ml = '"""';
-      i += 3;
-      continue;
-    }
-    if (line.startsWith("'''", i)) {
-      ml = "'''";
-      i += 3;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      i += 1;
-      while (i < line.length && line[i] !== ch) i += ch === '"' && line[i] === "\\" ? 2 : 1;
-      i += 1;
-      continue;
-    }
-    i += 1;
-  }
-  return ml;
+  return { code: line.slice(0, codeEnd), ml, depth };
 }
 
 /**
@@ -143,19 +133,22 @@ export interface TomlScan {
   legacy: boolean;
 }
 
+type Mode = "table" | "dotted" | null;
+
 /**
- * Removes our entry however it is spelled, leaving everything else as written. Inline
- * tables are single-line by the TOML spec, so a dotted definition of our key always ends
- * on its own line — but its value can be a multi-line string, whose lines are dropped
- * with it until the delimiter closes.
+ * Removes our entry however it is spelled, leaving everything else as written. Our
+ * table is skipped header to header (every value inside it goes with it), and a dotted
+ * key of ours is dropped with its whole value — after which scanning resumes exactly
+ * as before the key.
  */
 export function scanToml(text: string): TomlScan {
   const out: string[] = [];
   const seams: number[] = [];
   let server = false;
   let legacy = false;
-  let skipping = false;
-  let mlFromOursKey = false;
+  let mode: Mode = null;
+  let beforeKey: Mode = null;
+  let depth = 0;
   let ml: string | null = null;
   let table: string[] = [];
 
@@ -165,50 +158,74 @@ export function scanToml(text: string): TomlScan {
   };
   const drop = () => seams.push(out.length);
   const keep = (line: string) => out.push(line);
+  /** A dotted key's value ended: resume whatever the key interrupted. */
+  const endKey = () => {
+    mode = beforeKey;
+    beforeKey = null;
+  };
 
   for (const line of text.split("\n")) {
-    if (ml) {
-      ml = multiOpenAfter(line, ml);
-      if (skipping) drop();
+    const wasMl = ml;
+    const w = walkLine(line, ml);
+    const atDepth = depth;
+    ml = w.ml;
+    depth += w.depth;
+
+    if (wasMl) {
+      // string continuation: never a header, never a key — only the current skip applies
+      if (mode) drop();
       else keep(line);
-      if (!ml && mlFromOursKey) {
-        mlFromOursKey = false;
-        skipping = false;
+      if (mode === "dotted" && !ml && depth <= 0) endKey();
+      continue;
+    }
+
+    const t = w.code.trim();
+    const header = atDepth === 0 && t.startsWith("[") ? tomlTablePath(t) : null;
+    if (header) {
+      table = header;
+      depth = 0;
+      beforeKey = null;
+      if (isOursPath(header)) {
+        mode = "table";
+        saw(header);
+        drop();
+      } else {
+        mode = null;
+        keep(line);
       }
       continue;
     }
-    const t = codePart(line).trim();
-    if (t.startsWith("#")) {
-      if (skipping) drop();
+
+    if (!t) {
+      // blank or comment-only line
+      if (mode) drop();
       else keep(line);
       continue;
     }
-    const header = t.startsWith("[") ? tomlTablePath(t) : null;
-    if (header) {
-      table = header;
-      skipping = isOursPath(header);
-      if (skipping) {
-        saw(header);
-        drop();
-      } else keep(line);
-      continue;
-    }
+
     const eq = t.indexOf("=");
     const key = eq > 0 ? t.slice(0, eq).trim() : "";
     const path = Boolean(key) && !/[[\]{}]/.test(key) ? [...table, ...tomlKeyPath(key)] : null;
     if (path && isOursPath(path)) {
       saw(path);
       drop();
-      ml = multiOpenAfter(line, null);
-      if (ml) {
-        mlFromOursKey = true;
-        skipping = true;
-      }
+      beforeKey = mode;
+      mode = "dotted";
+      if (!ml && depth <= 0) endKey();
       continue;
     }
-    if (skipping) drop();
-    else keep(line);
-    ml = multiOpenAfter(line, null);
+
+    if (mode === "dotted") {
+      drop();
+      if (!ml && depth <= 0) endKey();
+      continue;
+    }
+    if (mode) {
+      // our table: skip header to header, whatever the values look like
+      drop();
+      continue;
+    }
+    keep(line);
   }
   return { text: collapseAtSeams(out, seams), server, legacy };
 }
